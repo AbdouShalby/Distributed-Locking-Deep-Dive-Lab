@@ -1,0 +1,19 @@
+{
+    "name": "abdoushalby/distributed-locking-lab",
+    "description": "Deep technical exploration of distributed locking strategies using Redis",
+    "type": "project",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "DistributedLocking\\": "src/"
+        }
+    },
+    "require": {
+        "php": "^8.4",
+        "ext-redis": "*",
+        "ext-pcntl": "*"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
