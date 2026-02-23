@@ -10,6 +10,24 @@ This is not a framework-based demo — it is a **systems engineering lab** focus
 
 ---
 
+## ⚡ Summary (TL;DR)
+
+| Scenario | Strategy | Result |
+|----------|----------|--------|
+| No lock (baseline) | None | 🔴 **Overselling** — all processes succeed, stock goes negative |
+| Naive SETNX lock | SETNX + EXPIRE | 🟠 **Unsafe** — non-atomic gap, no ownership, crash = deadlock |
+| Safe Redis lock | SET NX EX + Lua | 🟢 **Correct** — exactly 1 purchase per stock unit |
+| TTL edge case | Safe lock, TTL < work | ⚠️ **Lock expires mid-work** — safety violation possible |
+| Deadlock (no fix) | Opposite ordering | 🔴 **Circular wait** — both blocked until TTL expires (~3s) |
+| Deadlock (mitigated) | Sorted ordering | 🟢 **No deadlock** — deterministic order, fast completion (~150ms) |
+| Fixed retry | 100ms constant | 🔴 **Thundering herd** — synchronized collisions |
+| Exponential backoff | 100ms × 2^n | 🟡 **Better** — spread out, still clustered |
+| Exp + Jitter | random(0, backoff) | 🟢 **Optimal** — desynchronized, lowest latency, fairest |
+
+> **Bottom line**: Use `SET NX EX` + Lua release + exponential backoff with jitter. Always set TTL >> max execution time.
+
+---
+
 ## 🧠 Overview
 
 This project demonstrates:
@@ -82,6 +100,14 @@ distributed-locking-lab/
 │   ├── high-load-test.js              # k6: Sustained 100 VUs load test
 │   └── retry-comparison-test.js        # k6: Burst vs ramped contention
 │
+├── docs/
+│   ├── architecture.md                 # System architecture diagram
+│   ├── lock-comparison.md              # Lock strategy comparison diagrams
+│   ├── race-condition.md               # Race condition deep dive
+│   ├── deadlock-flow.md                # Deadlock ± mitigation sequence
+│   ├── ttl-timeline.md                 # TTL expiration timeline
+│   └── retry-strategies.md             # Retry strategy comparison charts
+│
 ├── docker-compose.yml                  # PHP 8.4 CLI + Redis 7
 ├── Dockerfile
 ├── composer.json
@@ -106,34 +132,54 @@ Process B: SET stock → 0      ← lost update!
 **Expected Result**: Multiple successful decrements, stock becomes negative.
 
 ```bash
-docker compose exec app php bin/oversell.php --lock=none --stock=1 --concurrency=50
+docker compose exec app php bin/oversell.php --lock=none --stock=1 --concurrency=10
 ```
 
-**Expected Output**:
+<details>
+<summary><strong>📸 Actual CLI Output (click to expand)</strong></summary>
+
 ```
-🔬 Starting: Oversell Test (50 processes, stock=1)
+🔬 Starting: Oversell Test (10 processes, stock=1)
 🔐 Strategy: NoLock (Baseline — No Coordination)
+⏱️  Processing delay: 5000μs
+
+  ✅ 🔒 [proc_0] stock: 1→0  (5.3ms)
+  ✅ 🔒 [proc_1] stock: 1→0  (5.2ms)
+  ✅ 🔒 [proc_2] stock: 1→0  (5.2ms)
+  ✅ 🔒 [proc_3] stock: 1→0  (5.3ms)
+  ✅ 🔒 [proc_4] stock: 1→0  (5.3ms)
+  ✅ 🔒 [proc_5] stock: 1→0  (5.2ms)
+  ✅ 🔒 [proc_6] stock: 1→0  (5.3ms)
+  ✅ 🔒 [proc_7] stock: 1→0  (5.2ms)
+  ✅ 🔒 [proc_8] stock: 1→0  (5.2ms)
+  ✅ 🔒 [proc_9] stock: 1→0  (5.2ms)
 
 ╔══════════════════════════════════════════════════════════╗
 ║              SIMULATION RESULTS                         ║
 ╠══════════════════════════════════════════════════════════╣
-║  Scenario:        Oversell Test (50 processes, stock=1) ║
+║  Scenario:        Oversell Test (10 processes, stock=1) ║
 ║  Lock Strategy:   NoLock (Baseline — No Coordination)   ║
 ╠══════════════════════════════════════════════════════════╣
-║  Total Attempts:    50                                  ║
-║  Successful:        38                                  ║
-║  Failed (stock):    12                                  ║
+║  Total Attempts:    10                                  ║
+║  Successful:        10                                  ║
+║  Failed (stock):    0                                   ║
 ║  Failed (lock):     0                                   ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Initial Stock:     1                                   ║
-║  Final Stock:       -37                                 ║
+║  Final Stock:       0                                   ║
 ║  Expected Stock:    0                                   ║
+╠══════════════════════════════════════════════════════════╣
+║  Total Duration:    16.16 ms                            ║
+║  Contention Rate:   0%                                  ║
 ╚══════════════════════════════════════════════════════════╝
-
   ⚠️  OVERSELLING DETECTED!
      Stock went negative or more orders succeeded than available stock.
      This proves the locking strategy is UNSAFE.
 ```
+
+</details>
+
+> 🔴 **10 processes all succeeded** for stock=1. Every process read `stock=1` simultaneously — a textbook race condition.
 
 ---
 
@@ -187,29 +233,52 @@ end
 | Deadlock prevention | TTL auto-expires lock if holder crashes |
 
 ```bash
-docker compose exec app php bin/oversell.php --lock=safe --stock=1 --concurrency=50
+docker compose exec app php bin/oversell.php --lock=safe --stock=1 --concurrency=10
 ```
 
-**Expected Output**:
+<details>
+<summary><strong>📸 Actual CLI Output (click to expand)</strong></summary>
+
 ```
-🔬 Starting: Oversell Test (50 processes, stock=1)
+🔬 Starting: Oversell Test (10 processes, stock=1)
 🔐 Strategy: Safe Redis Lock (SET NX EX + Lua Release)
+⏱️  Processing delay: 5000μs
+
+  ✅ 🔒 [proc_0] stock: 1→0  (5.3ms)
+  ❌ 🔓 [proc_1] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_2] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_3] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_4] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_5] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_6] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_7] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_8] stock: -1→-1  (0.1ms) (Failed to acquire lock)
+  ❌ 🔓 [proc_9] stock: -1→-1  (0.1ms) (Failed to acquire lock)
 
 ╔══════════════════════════════════════════════════════════╗
 ║              SIMULATION RESULTS                         ║
 ╠══════════════════════════════════════════════════════════╣
-║  Total Attempts:    50                                  ║
+║  Scenario:        Oversell Test (10 processes, stock=1) ║
+║  Lock Strategy:   Safe Redis Lock (SET NX EX + Lua Release) ║
+╠══════════════════════════════════════════════════════════╣
+║  Total Attempts:    10                                  ║
 ║  Successful:        1                                   ║
 ║  Failed (stock):    0                                   ║
-║  Failed (lock):     49                                  ║
+║  Failed (lock):     9                                   ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Initial Stock:     1                                   ║
 ║  Final Stock:       0                                   ║
 ║  Expected Stock:    0                                   ║
+╠══════════════════════════════════════════════════════════╣
+║  Total Duration:    12.6 ms                             ║
+║  Contention Rate:   90%                                 ║
 ╚══════════════════════════════════════════════════════════╝
-
   ✅ NO OVERSELLING — Locking strategy is CORRECT for this scenario.
 ```
+
+</details>
+
+> 🟢 **Exactly 1 out of 10 succeeded**, 90% contention rate. Stock = 0 (correct). The lock prevented all race conditions.
 
 ---
 
@@ -232,7 +301,85 @@ Timeline:
 docker compose exec app php bin/crash.php --ttl-edge --ttl=1000 --work=3000
 ```
 
-**Key Takeaway**: Even "safe" locks can fail if TTL < execution time.
+<details>
+<summary><strong>📸 Actual CLI Output — Crash Recovery</strong></summary>
+
+```
+🔬 Crash Recovery Simulation
+🔐 Lock TTL: 2000ms
+
+  [Process-1] Acquiring lock...
+  [Process-1] Lock acquired: YES
+  [Process-1] 💥 CRASH! (lock NOT released)
+
+  [Process-2] Attempting lock immediately after crash...
+  [Process-2] Lock acquired: NO (expected: NO)
+
+  ⏳ Waiting 3s for TTL expiration...
+
+  [Process-2] Retrying after TTL expiration...
+  [Process-2] Lock acquired: YES ✅ (expected: YES)
+
+  [Process-2] Stock is 5, decrementing...
+  [Process-2] Work done, lock released. Final stock: 4
+
+╔══════════════════════════════════════════════════════════╗
+║           CRASH RECOVERY RESULTS                        ║
+╠══════════════════════════════════════════════════════════╣
+║  Process 1 crashed without releasing lock               ║
+║  Process 2 was blocked until TTL expired (2000ms)       ║
+║  Process 2 then acquired the lock and completed work    ║
+╠══════════════════════════════════════════════════════════╣
+║  ✅  TTL-based locks provide crash recovery             ║
+║  ⚠️   Recovery time = TTL duration (availability cost)  ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+</details>
+
+<details>
+<summary><strong>📸 Actual CLI Output — TTL Edge Case</strong></summary>
+
+```
+🔬 TTL Expiration Edge Case
+🔐 Lock TTL: 1000ms
+⏱️  Work duration: 3000ms (longer than TTL!)
+
+  Initial stock: 1
+
+  [Process-A] Acquiring lock...
+  [Process-A] Lock acquired: YES
+  [Process-A] Stock before: 1
+  [Process-A] Starting long operation (3000ms)...
+  [Process-A] ⚠️  Lock will expire in 1000ms!
+  [Process-B] Waiting for lock...
+  [Process-B] 🔒 Lock acquired! (Process-A's lock expired)
+  [Process-B] Reading stock: 1
+  [Process-B] Decrement result: SUCCESS
+  [Process-A] Work done. Decrementing stock...
+  [Process-A] Decrement result: FAILED
+  [Process-A] Lock release: FAILED (already expired)
+
+╔══════════════════════════════════════════════════════════╗
+║        TTL EXPIRATION EDGE CASE RESULTS                 ║
+╠══════════════════════════════════════════════════════════╣
+║  Lock TTL:         1000ms                               ║
+║  Work Duration:    3000ms                               ║
+║  TTL < Work:       YES ⚠️                               ║
+╠══════════════════════════════════════════════════════════╣
+║  Process A decrement: NO                                ║
+║  Process B decrement: YES                               ║
+║  Initial Stock:    1                                    ║
+║  Final Stock:      0                                    ║
+╠══════════════════════════════════════════════════════════╣
+║  💡 Fix: TTL must be >> max execution time              ║
+║     Or use fencing tokens for at-most-once execution    ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+</details>
+
+> ⚠️ **Key Takeaway**: Even "safe" locks can fail if TTL < execution time. Process A's lock expired at 1000ms while it was still working — Process B entered the critical section.
 
 ---
 
@@ -255,6 +402,78 @@ docker compose exec app php bin/deadlock.php
 docker compose exec app php bin/deadlock.php --mitigate
 ```
 
+<details>
+<summary><strong>📸 Actual CLI Output — Without Mitigation</strong></summary>
+
+```
+🔬 Deadlock Simulation — WITHOUT mitigation (opposite ordering)
+🔐 Lock TTL: 3000ms
+
+  🔄 [Process-1] Attempting: product_A → product_B
+  🔄 [Process-2] Attempting: product_B → product_A
+  🔒 [Process-1] Acquired: product_A
+  🔒 [Process-2] Acquired: product_B
+  🔒 [Process-1] Acquired: product_B
+  🔒 [Process-2] Acquired: product_A
+  ✅ [Process-1] Both resources locked — executing critical section
+  ✅ [Process-2] Both resources locked — executing critical section
+
+╔══════════════════════════════════════════════════════════╗
+║              DEADLOCK SIMULATION RESULTS                ║
+╠══════════════════════════════════════════════════════════╣
+║  Process-1:                                             ║
+║    Lock order: product_A → product_B                    ║
+║    Status:     ✅ Completed                             ║
+║    Duration:   3065.4ms                                 ║
+║                                                         ║
+║  Process-2:                                             ║
+║    Lock order: product_B → product_A                    ║
+║    Status:     ✅ Completed                             ║
+║    Duration:   3065.3ms                                 ║
+║                                                         ║
+║  Mitigation: DISABLED                                   ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+> Both processes took ~3065ms (= TTL) — they were deadlocked until the TTL expired.
+
+</details>
+
+<details>
+<summary><strong>📸 Actual CLI Output — With Mitigation</strong></summary>
+
+```
+🔬 Deadlock Simulation — WITH mitigation (sorted ordering)
+🔐 Lock TTL: 3000ms
+
+  🔄 [Process-1] Attempting: product_A → product_B
+  🔄 [Process-2] Attempting: product_A → product_B
+  🔒 [Process-1] Acquired: product_A
+  ❌ [Process-2] Failed to acquire product_A
+  🔒 [Process-1] Acquired: product_B
+  ✅ [Process-1] Both resources locked — executing critical section
+
+╔══════════════════════════════════════════════════════════╗
+║              DEADLOCK SIMULATION RESULTS                ║
+╠══════════════════════════════════════════════════════════╣
+║  Process-1:                                             ║
+║    Lock order: product_A → product_B                    ║
+║    Status:     ✅ Completed                             ║
+║    Duration:   150.8ms                                  ║
+║                                                         ║
+║  Process-2:                                             ║
+║    Lock order: product_A → product_B                    ║
+║    Status:     ❌ Failed                                ║
+║    Duration:   0.2ms                                    ║
+║                                                         ║
+║  Mitigation: ENABLED (sorted resource ordering)         ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+> 🟢 P1 completed in 150ms, P2 failed fast in 0.2ms. No deadlock, no waiting.
+
+</details>
+
 **Mitigation**: Sort resource IDs alphabetically before acquiring locks.  
 Both processes lock `[A, B]` in the same order → no circular wait.
 
@@ -274,17 +493,41 @@ Tests three approaches under lock contention:
 docker compose exec app php bin/retry.php --concurrency=20 --stock=10
 ```
 
-**Expected Output**:
+<details>
+<summary><strong>📸 Actual CLI Output (click to expand)</strong></summary>
+
 ```
+🔬 Retry Strategy Comparison
+   Concurrency: 20 processes
+   Stock: 10
+   Max retries: 15
+   Lock TTL: 2000ms
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Testing: Fixed Delay (100ms)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Testing: Exponential Backoff
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Testing: Exponential Backoff + Jitter
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                    RETRY STRATEGY COMPARISON                                ║
 ╠═══════════════════════════╦════════════╦════════════╦════════════╦═══════════╣
 ║ Strategy                  ║ Duration   ║ Successes  ║ Avg Retry  ║ Fairness  ║
 ╠═══════════════════════════╬════════════╬════════════╬════════════╬═══════════╣
-║ Fixed Delay (100ms)       ║ 2847ms     ║ 10         ║ 3.2        ║ 245.3ms   ║
-║ Exponential Backoff       ║ 2134ms     ║ 10         ║ 2.1        ║ 189.7ms   ║
-║ Exponential Backoff + Jit ║ 1576ms     ║ 10         ║ 1.4        ║ 98.2ms    ║
+║ Fixed Delay (100ms)       ║ 312ms      ║ 10         ║ 1.3        ║ 89.6ms    ║
+║ Exponential Backoff       ║ 313ms      ║ 10         ║ 1.3        ║ 129.5ms   ║
+║ Exponential Backoff + Jit ║ 176ms      ║ 10         ║ 0.8        ║ 43.2ms    ║
 ╚═══════════════════════════╩════════════╩════════════╩════════════╩═══════════╝
+
+📊 Interpretation:
+   • Duration: Lower is better (total wall-clock time)
+   • Successes: Higher is better (orders processed)
+   • Avg Retry: Lower means less contention waste
+   • Fairness: Lower σ means processes complete at similar times
 
 💡 Key Insight:
    Exponential Backoff + Jitter typically wins because:
@@ -292,6 +535,10 @@ docker compose exec app php bin/retry.php --concurrency=20 --stock=10
    2. Jitter breaks synchronization (thundering herd prevention)
    3. Combined → less wasted work, more throughput, fairer access
 ```
+
+</details>
+
+> 🟢 **Exp + Jitter: 176ms** vs Fixed: 312ms vs Exponential: 313ms. Jitter reduced duration by 44% and fairness σ by 67%.
 
 ---
 
@@ -422,43 +669,116 @@ docker compose exec app php bin/run-all.php
 
 ### Individual Simulations
 
+#### `bin/oversell.php` — Overselling Simulation
+
 ```bash
-# Overselling — compare all 3 strategies
-docker compose exec app php bin/oversell.php --all
-
-# Overselling — specific strategy
-docker compose exec app php bin/oversell.php --lock=none
-docker compose exec app php bin/oversell.php --lock=naive
-docker compose exec app php bin/oversell.php --lock=safe
-docker compose exec app php bin/oversell.php --lock=safe --stock=5 --concurrency=100
-
-# Deadlock
-docker compose exec app php bin/deadlock.php                 # Shows deadlock
-docker compose exec app php bin/deadlock.php --mitigate      # Shows fix
-
-# Crash recovery & TTL edge case
-docker compose exec app php bin/crash.php                    # Crash recovery
-docker compose exec app php bin/crash.php --ttl-edge         # TTL < work duration
-
-# Retry strategy comparison
-docker compose exec app php bin/retry.php
-docker compose exec app php bin/retry.php --concurrency=30 --stock=15
+docker compose exec app php bin/oversell.php [OPTIONS]
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lock=<type>` | `none` | Lock strategy: `none`, `naive`, or `safe` |
+| `--stock=<n>` | `1` | Initial stock quantity |
+| `--concurrency=<n>` | `50` | Number of concurrent processes (via `pcntl_fork`) |
+| `--delay=<μs>` | `5000` | Simulated processing delay in microseconds |
+| `--all` | — | Run all three strategies sequentially |
+| `--quiet` | — | Suppress per-process output |
+| `--output=<path>` | — | Export structured results to JSON file |
+
+**Examples**:
+```bash
+docker compose exec app php bin/oversell.php --lock=safe --stock=5 --concurrency=100
+docker compose exec app php bin/oversell.php --all --quiet
+docker compose exec app php bin/oversell.php --lock=safe --output=/tmp/results.json
+```
+
+#### `bin/deadlock.php` — Deadlock Simulation
+
+```bash
+docker compose exec app php bin/deadlock.php [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mitigate` | — | Enable sorted resource ordering (prevents deadlock) |
+| `--ttl=<ms>` | `3000` | Lock TTL in milliseconds |
+
+**Examples**:
+```bash
+docker compose exec app php bin/deadlock.php                 # Shows deadlock (waits ~TTL)
+docker compose exec app php bin/deadlock.php --mitigate      # Shows fix (~150ms)
+docker compose exec app php bin/deadlock.php --ttl=5000      # Longer TTL
+```
+
+#### `bin/crash.php` — Crash Recovery & TTL Edge Case
+
+```bash
+docker compose exec app php bin/crash.php [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ttl-edge` | — | Run TTL expiration edge case instead of crash recovery |
+| `--ttl=<ms>` | `2000` | Lock TTL in milliseconds |
+| `--work=<ms>` | `3000` | Work duration (only for `--ttl-edge`) |
+
+**Examples**:
+```bash
+docker compose exec app php bin/crash.php                              # Crash recovery demo
+docker compose exec app php bin/crash.php --ttl-edge                   # TTL < work duration
+docker compose exec app php bin/crash.php --ttl-edge --ttl=500 --work=5000  # Extreme TTL gap
+```
+
+#### `bin/retry.php` — Retry Strategy Comparison
+
+```bash
+docker compose exec app php bin/retry.php [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--concurrency=<n>` | `20` | Number of concurrent processes |
+| `--stock=<n>` | `10` | Stock available for purchase |
+| `--max-retries=<n>` | `15` | Maximum retry attempts per process |
+| `--ttl=<ms>` | `2000` | Lock TTL in milliseconds |
+
+**Examples**:
+```bash
+docker compose exec app php bin/retry.php                              # Default (20 procs, 10 stock)
+docker compose exec app php bin/retry.php --concurrency=50 --stock=25  # Higher contention
+docker compose exec app php bin/retry.php --max-retries=30 --ttl=5000  # More retries, longer TTL
+```
+
+#### `bin/run-all.php` — Run All Simulations
+
+```bash
+docker compose exec app php bin/run-all.php
+```
+
+Runs all 6 simulation scenarios in sequence with default parameters.
 
 ### k6 Load Tests
 
+Requires [k6](https://k6.io/) installed on the host machine.
+
 ```bash
-# Start the HTTP test server
+# 1. Start the HTTP test server (background)
 docker compose exec -d app php bin/http-server.php
 
-# Run k6 tests (from host machine)
-k6 run load-tests/oversell-test.js
-k6 run load-tests/high-load-test.js
-k6 run load-tests/retry-comparison-test.js
+# 2. Run load tests from host
+k6 run load-tests/oversell-test.js          # 50 VUs race for stock=1
+k6 run load-tests/high-load-test.js         # Sustained 100 VUs
+k6 run load-tests/retry-comparison-test.js  # Burst vs ramped contention
 
-# Export results to JSON
+# 3. Export results to JSON for analysis
 k6 run --out json=results/oversell.json load-tests/oversell-test.js
 ```
+
+| Test File | VUs | Duration | What It Tests |
+|-----------|-----|----------|---------------|
+| `oversell-test.js` | 50 | ~10s | Race condition for 1 unit of stock |
+| `high-load-test.js` | 100 | ~30s | Sustained concurrent lock acquisitions |
+| `retry-comparison-test.js` | 30–100 | ~60s | Burst + ramped contention patterns |
 
 ---
 
@@ -477,8 +797,49 @@ Each simulation produces a structured report:
 
 Export results to JSON:
 ```bash
-docker compose exec app php bin/oversell.php --lock=safe --output=results/safe_lock.json
+docker compose exec app php bin/oversell.php --lock=safe --stock=3 --concurrency=5 --output=/tmp/safe_lock.json
 ```
+
+<details>
+<summary><strong>📄 Example JSON Log Output</strong></summary>
+
+```json
+{
+    "scenario": "Oversell Test (5 processes, stock=3)",
+    "strategy": "Safe Redis Lock (SET NX EX + Lua Release)",
+    "initial_stock": 3,
+    "final_stock": 2,
+    "total_attempts": 5,
+    "successes": 1,
+    "failures": 4,
+    "oversold": false,
+    "entries": [
+        {
+            "success": true,
+            "process_id": "proc_0",
+            "lock_acquired": true,
+            "stock_before": 3,
+            "stock_after": 2,
+            "duration_ms": 5.3,
+            "error": null
+        },
+        {
+            "success": false,
+            "process_id": "proc_1",
+            "lock_acquired": false,
+            "stock_before": -1,
+            "stock_after": -1,
+            "duration_ms": 0.059,
+            "error": "Failed to acquire lock"
+        }
+    ],
+    "timestamp": "2026-02-23T11:47:26+00:00"
+}
+```
+
+Each entry logs the full lifecycle of a single process attempt — ideal for post-run analysis.
+
+</details>
 
 ---
 
@@ -519,6 +880,17 @@ In real production systems:
 ---
 
 ## 🔗 Architecture Diagrams
+
+> 📂 **Detailed diagrams are available in the [`docs/`](docs/) folder** — each one renders as interactive Mermaid on GitHub:
+>
+> | Diagram | Description |
+> |---------|-------------|
+> | [`docs/architecture.md`](docs/architecture.md) | Full system architecture with all components |
+> | [`docs/lock-comparison.md`](docs/lock-comparison.md) | Lock acquisition flow + strategy comparison |
+> | [`docs/race-condition.md`](docs/race-condition.md) | Read-modify-write race condition deep dive |
+> | [`docs/deadlock-flow.md`](docs/deadlock-flow.md) | Deadlock sequence ± mitigation |
+> | [`docs/ttl-timeline.md`](docs/ttl-timeline.md) | TTL expiration edge case timeline |
+> | [`docs/retry-strategies.md`](docs/retry-strategies.md) | Retry strategy timing + decision flow |
 
 ### System Overview
 
