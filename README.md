@@ -869,7 +869,34 @@ In real production systems:
 
 ---
 
-## 📌 Future Improvements
+## � When NOT to Use Distributed Locking
+
+Distributed locks add latency, failure modes, and operational complexity. Before reaching for one, consider whether a simpler approach solves the problem:
+
+| Situation | Why Locking is Wrong | Use Instead |
+|-----------|---------------------|-------------|
+| **Single-process application** | No cross-process contention exists | In-process mutex (`flock`, `sync.Mutex`, `synchronized`) |
+| **Idempotent operations** | Re-execution produces the same result — no conflict to prevent | Idempotency keys + safe retries |
+| **Database can enforce correctness** | The DB already serializes access at the row level | `UNIQUE` constraints, `CHECK` constraints, optimistic locking (`WHERE version = ?`) |
+| **Simple atomic counters** | Lock-read-write-unlock is 4 round trips for a single increment | `INCR` / `INCRBY` (Redis), `UPDATE stock = stock - 1` (SQL) |
+| **Eventual consistency is acceptable** | Strict ordering isn't required — last-write-wins is fine | CRDTs, event sourcing, or merge strategies |
+| **High-throughput hot paths** | Lock contention becomes a bottleneck under load | Queue-based serialization (one consumer, zero contention) |
+
+### The Decision Rule
+
+```
+Can the database enforce it?          → Don't lock. Use constraints.
+Can the operation be made idempotent? → Don't lock. Retry safely.
+Is it a single atomic update?         → Don't lock. Use atomic ops.
+Do you need cross-service coordination on shared mutable state
+  with strict correctness guarantees?  → Now you need a distributed lock.
+```
+
+> ⚠️ **Honest trade-off**: This lab focuses on the cases where distributed locking IS the right tool. But in production, most concurrency problems are better solved by DB constraints or idempotency. Distributed locks should be the **last resort**, not the first instinct.
+
+---
+
+## �📌 Future Improvements
 
 - [ ] Multi-node Redlock demo (3 Redis instances)
 - [ ] Prometheus metrics + Grafana visualization dashboard
