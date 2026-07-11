@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint & validate
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: redis, pcntl
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: PHP syntax lint (all sources)
+        run: |
+          set -e
+          find src bin -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Smoke test — race condition simulation runs against real Redis
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+        run: |
+          # Prove the lab actually executes end-to-end in CI, not just parses.
+          timeout 120 php bin/oversell.php --lock=safe --stock=5 --concurrency=20 --quiet || {
+            echo "oversell simulation failed to run"; exit 1; }
